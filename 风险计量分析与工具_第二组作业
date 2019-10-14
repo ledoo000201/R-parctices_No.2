@@ -1,0 +1,199 @@
+library("tidyverse")
+library("quantmod")
+library("lubridate")
+library("readxl")
+library("highcharter")
+library("tidyquant")
+library("timetk")
+library("tibbletime")
+library("PerformanceAnalytics")
+library("scales")
+
+library(DBI)
+library(RMySQL)
+mydb<- dbConnect(MySQL(),user='ktruc002', password='35442fed', dbname='cn_stock_quote', host='172.19.3.250') 
+SQL_statement<- "SELECT  `trade_date`,  `index_code`,  `index_name`,  `last`,  `input_time` 
+FROM `cn_stock_index`.`daily_quote`
+WHERE index_code IN('CN5083','CN5084','CN5085','CN5086','CN5087') 
+                 AND trade_date BETWEEN('2009-12-29 00:00:00') AND ('2018-12-31 00:00:00')
+ORDER BY `trade_date` DESC, `index_name` DESC" 
+#选择了国证半导、电信服务、服装纺织、工业服务、工业用品2009年末至2018末的收盘价数据
+#dbGetQuery(mydb,SQL_statement)
+rowdata <- dbGetQuery(mydb,SQL_statement) #导入原始数据
+
+# 处理原始数据
+library(dplyr)
+data1<-select(rowdata,trade_date,index_code,last) 
+library(tidyr)
+mydata<-spread(data1,index_code,last) 
+
+#将原来的数据格式转化为xts格式
+library(xts) 
+mydata<-xts(mydata[,c(2:6)],order.by = as.Date(mydata$trade_date)) 
+
+#Converting Daily Prices to Monthly Returns in the xts world
+prices_monthly <- to.monthly(mydata,
+                             indexAt = "lastof",
+                             OHLC = FALSE)
+
+head(prices_monthly, 3)
+
+#calculate log returns
+asset_returns_xts <-
+  Return.calculate(prices_monthly,
+                   method = "log") %>%
+  na.omit()
+
+head(asset_returns_xts, 3)
+
+symbols <- c('CN5083','CN5084','CN5085','CN5086','CN5087')
+
+#Converting Daily Prices to Monthly Returns in the tidyverse
+asset_returns_dplyr_byhand <-
+  mydata %>%
+  to.monthly(indexAt = "lastof", OHLC = FALSE) %>%
+  # convert the index to a date
+  data.frame(date = index(.)) %>%
+  # now remove the index because it got converted to row names
+  remove_rownames() %>%
+  gather(asset, mydata, -date) %>%
+  group_by(asset) %>%
+  mutate(returns = (log(mydata) - log(lag(mydata)))) %>%
+  select(-mydata) %>%
+  spread(asset, returns) %>%
+  select(date, symbols)
+
+head(asset_returns_dplyr_byhand, 3)
+
+#Converting Daily Prices to Monthly Returns in the tidyquant world
+asset_returns_tq_builtin <-
+  mydata %>%
+  tk_tbl(preserve_index = TRUE,
+         rename_index = "date") %>%
+  gather(asset, mydata, -date) %>%
+  group_by(asset) %>%
+  tq_transmute(mutate_fun = periodReturn,
+               period = "monthly",
+               type = "log") %>%
+  spread(asset, monthly.returns) %>%
+  select(date, symbols) %>%
+  slice(-1)
+
+head(asset_returns_tq_builtin, 3)
+
+#Converting Daily Prices to Monthly Returns with tibbletime
+asset_returns_tbltime <-
+  prices2 %>%
+  tk_tbl(preserve_index = TRUE,
+         rename_index = "date") %>%
+  # this is the the tibbletime function
+  as_tbl_time(index = date) %>%
+  as_period(period = "month",
+            side = "end") %>%
+  gather(asset, returns, -date) %>%
+  group_by(asset) %>%
+  tq_transmute(mutate_fun = periodReturn,
+               type = "log") %>%
+  spread(asset, monthly.returns) %>%
+  select(date, symbols) %>%
+  slice(-1)
+
+#For asset returns to be tidy, we need a column called “date”, 
+#a column called “asset” and a column called “returns
+asset_returns_long <-
+  asset_returns_dplyr_byhand %>%
+  gather(asset, returns, -date) %>%
+  group_by(asset)
+tail(asset_returns_long, 3)
+
+#Visualizing Asset Returns in the xts  world
+library("highcharter")
+#To get monthly log return chart
+highchart(type = "stock") %>%
+  hc_title(text = "Monthly Log Returns") %>%
+  hc_add_series(asset_returns_xts[, symbols[1]],
+                name = symbols[1]) %>%
+  hc_add_series(asset_returns_xts[, symbols[2]],
+                name = symbols[2]) %>%
+  hc_add_series(asset_returns_xts[, symbols[3]],
+                name = symbols[3]) %>%
+  hc_add_series(asset_returns_xts[, symbols[4]],
+                name = symbols[4]) %>%
+  hc_add_series(asset_returns_xts[, symbols[5]],
+                name = symbols[5]) %>%
+  hc_add_theme(hc_theme_flat()) %>%
+  hc_navigator(enabled = FALSE) %>%
+  hc_scrollbar(enabled = FALSE) %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_legend(enabled = TRUE)
+
+#To make SPY log return distribution histogram
+hc_hist <- hist(asset_returns_xts[, symbols[1]],
+                breaks = 50,
+                plot = FALSE)
+hchart(hc_hist, color = "cornflowerblue") %>%
+  hc_title(text =
+             paste(symbols[1],
+                   "Log Returns Distribution",
+                   sep = " ")) %>%
+  hc_add_theme(hc_theme_flat()) %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_legend(enabled = FALSE)
+
+#To define a function for building those histogram
+hc_hist_fun <- function(n = 1, object, color){
+  hc_hist <- hist(object[, symbols[n]],
+                  breaks = 50,
+                  plot = FALSE)
+  hchart(hc_hist, color = color) %>%
+    hc_title(text =
+               paste(symbols[n],
+                     "Log Returns Distribution",
+                     sep = " ")) %>%
+    hc_add_theme(hc_theme_flat()) %>%
+    hc_exporting(enabled = TRUE) %>%
+    hc_legend(enabled = FALSE)
+}
+hc_hist_fun(1, asset_returns_xts, "cornflowerblue")
+hc_hist_fun(2, asset_returns_xts, "green")
+hc_hist_fun(3, asset_returns_xts, "pink")
+hc_hist_fun(4, asset_returns_xts, "purple")
+hc_hist_fun(5, asset_returns_xts, "yellow")
+
+#loop over each column to create a separate histogram for each
+map(1:5, hc_hist_fun, asset_returns_xts, "blue")
+
+#Visualizing Asset Returns in the tidyverse
+asset_returns_long %>%
+  ggplot(aes(x = returns, fill = asset)) +
+  geom_histogram(alpha = 0.45, binwidth = .005) +
+  ggtitle("Monthly Returns Since 2009")
+
+#facet_wrap(~asset) will break this into 5 charts
+asset_returns_long %>%
+  ggplot(aes(x = returns, fill = asset)) +
+  geom_histogram(alpha = 0.45, binwidth = .01) +
+  facet_wrap(~asset) +
+  ggtitle("Monthly Returns Since 2009") +
+  theme_update(plot.title = element_text(hjust = 0.5))
+
+#add a density line and labels for x axis & y axis
+asset_returns_long %>%
+  ggplot(aes(x = returns, colour = asset)) +
+  geom_density(alpha = 1) +
+  ggtitle("Monthly Returns Density Since 2009") +
+  xlab("monthly returns") +
+  ylab("distribution") +
+  theme_update(plot.title = element_text(hjust = 0.5))
+
+#combine density chart with histogram
+asset_returns_long %>%
+  ggplot(aes(x = returns)) +
+  geom_density(aes(color = asset), alpha = 1) +
+  geom_histogram(aes(fill = asset), alpha = 0.45, binwidth = .01) +
+  guides(fill = FALSE) +
+  facet_wrap(~asset) +
+  ggtitle("Monthly Returns Since 2009") +
+  xlab("monthly returns") +
+  ylab("distribution") +
+  theme_update(plot.title = element_text(hjust = 0.5))
